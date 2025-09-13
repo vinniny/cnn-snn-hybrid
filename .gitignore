@@ -1,12 +1,6 @@
-.venv/
-# Byte-compiled / cache files
 __pycache__/
-*.py[cod]
-
-# Virtual environments
 .venv/
-env/
-venv/
-
-# IDE files
-.vscode/
+*.pt
+*.png
+data/
+results/
