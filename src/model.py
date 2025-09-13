@@ -1,4 +1,4 @@
-"""Model definitions for CNN baseline and CNN→SNN hybrid."""
+"""Convolutional baseline and CNN→SNN hybrid models."""
 
 from __future__ import annotations
 
@@ -6,77 +6,71 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import snntorch as snn
-from snntorch import surrogate
+
+__all__ = ["CNNOnly", "CNNSNN"]
 
 
-class CNN(nn.Module):
-    """Baseline CNN for MNIST.
-
-    Architecture:
-    Conv(1→12, k=5) → ReLU → MaxPool → Conv(12→64, k=5) → ReLU → MaxPool →
-    Flatten → Linear(64*4*4→10).
-    """
+class CNNOnly(nn.Module):
+    """Pure CNN with two conv layers followed by a fully connected head."""
 
     def __init__(self) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(1, 12, 5)
-        self.drop1 = nn.Dropout2d(p=0.2)
         self.conv2 = nn.Conv2d(12, 64, 5)
-        self.drop2 = nn.Dropout2d(p=0.2)
         self.fc = nn.Linear(64 * 4 * 4, 10)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(F.max_pool2d(self.conv1(x), 2))
-        x = self.drop1(x)
-        x = F.relu(F.max_pool2d(self.conv2(x), 2))
-        x = self.drop2(x)
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
 
 class CNNSNN(nn.Module):
-    """CNN feature extractor with LIF spiking head.
+    """CNN feature extractor with LIF spiking neurons."""
 
-    Follows the same convolutional stack as :class:`CNN` but replaces ReLU
-    activations with LIF neurons to introduce temporal dynamics.
-    """
-
-    def __init__(self, T: int = 20, beta: float = 0.9) -> None:
+    def __init__(self, beta: float = 0.9) -> None:
         super().__init__()
-        self.T = T
         self.conv1 = nn.Conv2d(1, 12, 5)
-        self.drop1 = nn.Dropout2d(p=0.2)
         self.conv2 = nn.Conv2d(12, 64, 5)
-        self.drop2 = nn.Dropout2d(p=0.2)
         self.fc = nn.Linear(64 * 4 * 4, 10)
 
-        spike_grad = surrogate.fast_sigmoid()
-        self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
-        self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad)
-        self.lif3 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+        self.lif1 = snn.Leaky(beta=beta)
+        self.lif2 = snn.Leaky(beta=beta)
+        self.lif3 = snn.Leaky(beta=beta)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return spike recordings of shape ``[T, batch, 10]``."""
-
-        batch_size = x.size(0)
-        mem1 = self.lif1.init_leaky(batch_size, (12, 24, 24), x.device)
-        mem2 = self.lif2.init_leaky(batch_size, (64, 8, 8), x.device)
-        mem3 = self.lif3.init_leaky(batch_size, 10, x.device)
-
-        spk_rec = []
-        for _ in range(self.T):
-            cur1 = F.max_pool2d(self.conv1(x), 2)
-            cur1 = self.drop1(cur1)
-            spk1, mem1 = self.lif1(cur1, mem1)
-
-            cur2 = F.max_pool2d(self.conv2(spk1), 2)
-            cur2 = self.drop2(cur2)
-            spk2, mem2 = self.lif2(cur2, mem2)
-
-            cur3 = spk2.view(batch_size, -1)
+    def init_state(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch = x.size(0)
+        with torch.no_grad():
+            cur1 = self.conv1(x)
+            mem1 = torch.zeros((batch, *cur1.shape[1:]), device=x.device)
+            cur1 = F.max_pool2d(cur1, 2)
+            cur2 = self.conv2(cur1)
+            mem2 = torch.zeros((batch, *cur2.shape[1:]), device=x.device)
+            cur2 = F.max_pool2d(cur2, 2)
+            cur3 = cur2.view(batch, -1)
             cur3 = self.fc(cur3)
-            spk3, mem3 = self.lif3(cur3, mem3)
-            spk_rec.append(spk3)
+            mem3 = torch.zeros((batch, cur3.shape[1]), device=x.device)
+        return mem1, mem2, mem3
 
-        return torch.stack(spk_rec)
+    def forward_step(
+        self,
+        x: torch.Tensor,
+        mem1: torch.Tensor,
+        mem2: torch.Tensor,
+        mem3: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cur1 = self.conv1(x)
+        spk1, mem1 = self.lif1(cur1, mem1)
+        cur1 = F.max_pool2d(spk1, 2)
 
+        cur2 = self.conv2(cur1)
+        spk2, mem2 = self.lif2(cur2, mem2)
+        cur2 = F.max_pool2d(spk2, 2)
+
+        cur3 = cur2.view(cur2.size(0), -1)
+        cur3 = self.fc(cur3)
+        spk3, mem3 = self.lif3(cur3, mem3)
+        return spk3, mem1, mem2, mem3
